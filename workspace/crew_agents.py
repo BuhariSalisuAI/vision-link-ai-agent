@@ -23,16 +23,15 @@ from crewai_tools import BaseTool
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
-# LLM config  (Groq via OpenAI-compatible endpoint that CrewAI supports)
+# LLM config  (Meta Llama-3-8B-Instruct via HuggingFace Inference API)
+# HF_TOKEN is read from environment / GitHub Actions secret — never hardcoded
 # ---------------------------------------------------------------------------
-GROQ_API_KEY  = os.environ["GROQ_API_KEY"]
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL    = "groq/llama-3.3-70b-versatile"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_MODEL  = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 _llm_config = dict(
-    model=GROQ_MODEL,
-    api_key=GROQ_API_KEY,
-    base_url=GROQ_BASE_URL,
+    model=f"huggingface/{HF_MODEL}",
+    api_key=HF_TOKEN,
 )
 
 
