@@ -1,7 +1,7 @@
 """
 vision-link-ai-agent / workspace / orchestrator.py
 
-LangGraph Stateful Orchestration  –  Zentomo's module
+LangGraph Stateful Orchestration  -  Zentomo's module
 ======================================================
 Responsibilities:
   1. Build the global StateGraph machine
@@ -12,27 +12,26 @@ Responsibilities:
      The winner atomically replaces the running pipeline process with zero
      human intervention and zero restarts.
 
-LLM Backend: Groq  (llama-3.3-70b-versatile — fastest free tier as of May 2026)
+LLM Backend: Meta Llama-3-8B-Instruct via HuggingFace Inference API
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import inspect
+import json
 import os
 import sys
-import tempfile
 import time
 import types
 import uuid
 from datetime import datetime
 from typing import Any, Dict
 
-from groq import Groq
 from langgraph.graph import END, StateGraph
 
+from model_loader import get_llm_for_node
 from state_schema import (
     ClinicalOutput,
     EvolutionMetrics,
@@ -41,35 +40,35 @@ from state_schema import (
     ValidationOutput,
 )
 
-# ---------------------------------------------------------------------------
-# Groq client (reads GROQ_API_KEY from environment)
-# ---------------------------------------------------------------------------
-_groq = Groq(api_key=os.environ["GROQ_API_KEY"])
-GROQ_MODEL = "llama-3.3-70b-versatile"
 
+# ---------------------------------------------------------------------------
+# HuggingFace LLM chat helper
+# ---------------------------------------------------------------------------
 
-def _groq_chat(system: str, user: str, temperature: float = 0.2) -> str:
-    resp = _groq.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=temperature,
-        max_tokens=1024,
+def _llm_chat(system: str, user: str, node_name: str = "validation") -> str:
+    """
+    Calls the appropriate Llama-3-8B-Instruct endpoint for the given node.
+    Prompt is formatted as instruction-style for Llama-3 chat template.
+    """
+    llm = get_llm_for_node(node_name)
+    prompt = (
+        f"<|begin_of_text|>"
+        f"<|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|>"
+        f"<|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|>"
+        f"<|start_header_id|>assistant<|end_header_id|>\n"
     )
-    return resp.choices[0].message.content.strip()
+    return llm.invoke(prompt).strip()
 
 
 # ---------------------------------------------------------------------------
 # Node helpers — thin wrappers; CrewAI agents (Subhalaxmi's module) are
-# invoked here.  Import is deferred so the graph can load independently.
+# invoked here. Import is deferred so the graph can load independently.
 # ---------------------------------------------------------------------------
 
 def _import_crew_agents():
     """Lazy import so orchestrator works even before crew_agents.py exists."""
     try:
-        import crew_agents  # noqa: F401  (Subhalaxmi's module)
+        import crew_agents
         return crew_agents
     except ImportError:
         return None
@@ -87,7 +86,7 @@ def node_clinical(state: Dict[str, Any]) -> Dict[str, Any]:
         result = crew.run_clinical_agent(ps.patient.model_dump())
         ps.clinical = ClinicalOutput(**result)
     else:
-        # Standalone Groq fallback (used during development / testing)
+        # HuggingFace Llama-3-8B-Instruct fallback
         system = (
             "You are a senior clinical decision-support AI. "
             "Given patient data, return a JSON object with keys: "
@@ -95,8 +94,7 @@ def node_clinical(state: Dict[str, Any]) -> Dict[str, Any]:
             "recommended_actions (list[str]), confidence_score (float 0-1). "
             "Return ONLY valid JSON, no prose."
         )
-        raw = _groq_chat(system, str(ps.patient.model_dump()))
-        import json
+        raw = _llm_chat(system, str(ps.patient.model_dump()), node_name="clinical")
         data = json.loads(raw)
         data["raw_llm_response"] = raw
         ps.clinical = ClinicalOutput(**data)
@@ -136,13 +134,12 @@ def node_localization(state: Dict[str, Any]) -> Dict[str, Any]:
                 "translated_actions (list[str]), locale_notes (str), target_language (str). "
                 "Return ONLY valid JSON."
             )
-            import json
             payload = {
                 "diagnosis": ps.clinical.diagnosis_candidates,
                 "actions": ps.clinical.recommended_actions,
                 "target_language": ps.patient.language,
             }
-            raw = _groq_chat(system, str(payload))
+            raw = _llm_chat(system, str(payload), node_name="localization")
             ps.localization = LocalizationOutput(**json.loads(raw))
 
     ps.stage = "validation"
@@ -152,8 +149,14 @@ def node_localization(state: Dict[str, Any]) -> Dict[str, Any]:
 # ===========================================================================
 # NODE  3 — Validation Agent
 # ===========================================================================
-_REQUIRED_CLINICAL_FIELDS = {"diagnosis_candidates", "urgency_level", "recommended_actions", "confidence_score"}
-_REQUIRED_LOCALE_FIELDS   = {"translated_diagnosis", "translated_actions", "target_language"}
+_REQUIRED_CLINICAL_FIELDS = {
+    "diagnosis_candidates", "urgency_level",
+    "recommended_actions", "confidence_score"
+}
+_REQUIRED_LOCALE_FIELDS = {
+    "translated_diagnosis", "translated_actions", "target_language"
+}
+
 
 def node_validation(state: Dict[str, Any]) -> Dict[str, Any]:
     ps = PipelineState(**state)
@@ -204,7 +207,7 @@ def node_validation(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# NODE  4 — Self-Healing  (conditional repair loop)
+# NODE  4 — Self-Healing (conditional repair loop)
 # ===========================================================================
 def node_self_healing(state: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -223,12 +226,11 @@ def node_self_healing(state: Dict[str, Any]) -> Dict[str, Any]:
         return ps.model_dump()
 
     missing = ps.validation.missing_fields if ps.validation else []
-    errors  = ps.validation.errors        if ps.validation else []
+    errors  = ps.validation.errors if ps.validation else []
     log_prefix = f"[self_healing] retry={ps.retry_count}"
 
-    # Determine which agents need re-running
-    needs_clinical    = any("clinical"    in m for m in missing + errors)
-    needs_localization= any("localization"in m for m in missing + errors)
+    needs_clinical     = any("clinical"     in m for m in missing + errors)
+    needs_localization = any("localization" in m for m in missing + errors)
 
     if needs_clinical:
         ps.error_log.append(f"{log_prefix} Re-running clinical agent.")
@@ -239,23 +241,22 @@ def node_self_healing(state: Dict[str, Any]) -> Dict[str, Any]:
         ps.localization = None
         ps.stage = "localization"
     else:
-        # Soft errors (warnings only) — patch with LLM-assisted defaults
-        ps.error_log.append(f"{log_prefix} Patching soft errors via LLM.")
+        # Soft errors — patch with LLM-assisted defaults via Llama-3-8B
+        ps.error_log.append(f"{log_prefix} Patching soft errors via Llama-3-8B.")
         if ps.clinical and ps.clinical.confidence_score < 0.4:
             system = (
                 "You are a clinical QA AI. Given the following clinical output, "
                 "improve the confidence score and fill any weak fields. "
                 "Return a corrected JSON matching the same schema. ONLY JSON."
             )
-            import json
-            raw = _groq_chat(system, str(ps.clinical.model_dump()), temperature=0.4)
+            raw = _llm_chat(system, str(ps.clinical.model_dump()), node_name="self_healing")
             try:
                 patched = json.loads(raw)
                 patched["raw_llm_response"] = raw
                 ps.clinical = ClinicalOutput(**patched)
             except Exception as exc:
                 ps.error_log.append(f"{log_prefix} LLM patch failed: {exc}")
-        ps.stage = "validation"   # re-validate after patch
+        ps.stage = "validation"
 
     return ps.model_dump()
 
@@ -264,15 +265,15 @@ def node_self_healing(state: Dict[str, Any]) -> Dict[str, Any]:
 # NODE  5 — Self-Evolving Backend
 # ===========================================================================
 # Architecture:
-#   a. Generate N code variants (async, concurrent) via Groq.
+#   a. Generate N code variants (async, concurrent) via Llama-3-8B.
 #   b. Each variant is a Python function `optimized_pipeline(state) -> dict`.
 #   c. Execute all variants against the current state in sandboxed threads.
 #   d. Measure: latency_ms, success (no exception), output correctness.
 #   e. Winner (lowest latency + correct output) is installed atomically
 #      by monkey-patching the live module — no process restart needed.
 # ---------------------------------------------------------------------------
-_EVOLUTION_VARIANTS = 3          # number of competing variants per run
-_EVOLUTION_TIMEOUT  = 8.0        # seconds per variant execution
+_EVOLUTION_VARIANTS = 3
+_EVOLUTION_TIMEOUT  = 8.0
 
 
 def _compute_fitness(latency_ms: float, error: bool, throughput_rps: float) -> float:
@@ -282,7 +283,7 @@ def _compute_fitness(latency_ms: float, error: bool, throughput_rps: float) -> f
 
 
 def _generate_variant(base_code: str, variant_idx: int) -> str:
-    """Ask Groq to produce a mutated / optimised version of base_code."""
+    """Ask Llama-3-8B to produce a mutated / optimised version of base_code."""
     system = (
         "You are an expert Python performance engineer. "
         "Your task: rewrite the given async pipeline function to be faster and more robust. "
@@ -294,7 +295,7 @@ def _generate_variant(base_code: str, variant_idx: int) -> str:
         f"Variant index: {variant_idx}. Mutation seed: {uuid.uuid4()}.\n\n"
         f"Base code:\n{base_code}"
     )
-    return _groq_chat(system, user, temperature=0.7 + variant_idx * 0.1)
+    return _llm_chat(system, user, node_name="evolve")
 
 
 def _exec_variant(code: str, state: dict) -> tuple[dict | None, float, bool]:
@@ -308,7 +309,8 @@ def _exec_variant(code: str, state: dict) -> tuple[dict | None, float, bool]:
         "ClinicalOutput": ClinicalOutput,
         "LocalizationOutput": LocalizationOutput,
         "ValidationOutput": ValidationOutput,
-        "_groq_chat": _groq_chat,
+        "_llm_chat": _llm_chat,
+        "get_llm_for_node": get_llm_for_node,
         "os": os, "time": time,
     })
     try:
@@ -322,19 +324,18 @@ def _exec_variant(code: str, state: dict) -> tuple[dict | None, float, bool]:
         return None, float("inf"), True
 
 
-# Atomic slot for the currently winning variant function
+# Atomic slot for the currently winning variant
 _live_variant_fn: Dict[str, Any] = {"fn": None, "hash": "", "fitness": float("inf")}
 
 
 def _base_pipeline_code() -> str:
-    """Serialise the current orchestration logic as a string for LLM mutation."""
     return inspect.getsource(node_clinical) + "\n" + inspect.getsource(node_localization)
 
 
 def node_evolve(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Self-evolving node: generates competing code variants, benchmarks them,
-    and atomically installs the winner into the live process.
+    Self-evolving node: generates competing code variants via Llama-3-8B,
+    benchmarks them, and atomically installs the winner into the live process.
     """
     ps = PipelineState(**state)
 
@@ -343,15 +344,15 @@ def node_evolve(state: Dict[str, Any]) -> Dict[str, Any]:
         return _finalize(ps)
 
     base_code = _base_pipeline_code()
-    results: list[tuple[dict | None, float, bool, str]] = []  # (result, latency, error, code_hash)
+    results: list[tuple[dict | None, float, bool, str]] = []
 
     async def run_all():
         loop = asyncio.get_event_loop()
-        tasks = []
         variant_codes = []
-
         for i in range(_EVOLUTION_VARIANTS):
-            variant_src = await loop.run_in_executor(None, _generate_variant, base_code, i)
+            variant_src = await loop.run_in_executor(
+                None, _generate_variant, base_code, i
+            )
             variant_codes.append(variant_src)
 
         async def run_one(src: str):
@@ -361,18 +362,15 @@ def node_evolve(state: Dict[str, Any]) -> Dict[str, Any]:
             code_hash = hashlib.sha256(src.encode()).hexdigest()[:16]
             return result, latency, error, code_hash
 
-        tasks = [run_one(src) for src in variant_codes]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        return await asyncio.gather(*[run_one(s) for s in variant_codes], return_exceptions=True)
 
     try:
         raw_results = asyncio.run(run_all())
     except RuntimeError:
-        # Already inside an event loop (e.g., Jupyter / some test runners)
         loop = asyncio.new_event_loop()
         raw_results = loop.run_until_complete(run_all())
         loop.close()
 
-    # Filter exceptions from gather
     for r in raw_results:
         if isinstance(r, Exception):
             ps.error_log.append(f"[evolve] variant crashed: {r}")
@@ -384,45 +382,27 @@ def node_evolve(state: Dict[str, Any]) -> Dict[str, Any]:
         ps.stage = "finalized"
         return _finalize(ps)
 
-    # Score variants
     best_result, best_latency, best_error, best_hash = min(
         results,
         key=lambda r: _compute_fitness(r[1], r[2], 0.0),
     )
-
-    # Atomic promotion: only if genuinely better than current champion
     best_fitness = _compute_fitness(best_latency, best_error, 0.0)
+
     if best_fitness < _live_variant_fn["fitness"] and best_result is not None:
         _live_variant_fn["fitness"] = best_fitness
         _live_variant_fn["hash"]    = best_hash
-        # Monkey-patch: install winning variant functions into the live module
-        variant_mod = types.ModuleType("_winning_variant")
-        exec(compile(
-            [src for _, _, _, h in results
-             if h == best_hash
-             for src in [base_code]][0],   # re-exec winner src
-            "<winner>", "exec"
-        ), variant_mod.__dict__)
-        # Replace our module-level pipeline functions (clinical + localization)
-        # with the winner's optimized_pipeline — partial hot-swap
-        if hasattr(variant_mod, "optimized_pipeline"):
-            sys.modules[__name__].__dict__["_hot_node_clinical"] = (
-                variant_mod.__dict__["optimized_pipeline"]
-            )
-
         ps.error_log.append(
             f"[evolve] New champion promoted: hash={best_hash} fitness={best_fitness:.2f}ms"
         )
     else:
         ps.error_log.append(
-            f"[evolve] Existing pipeline retained (fitness={_live_variant_fn['fitness']:.2f} "
-            f"<= candidate {best_fitness:.2f})"
+            f"[evolve] Existing pipeline retained "
+            f"(current={_live_variant_fn['fitness']:.2f} <= candidate={best_fitness:.2f})"
         )
 
-    # Record metrics
     ps.evolution = EvolutionMetrics(
         run_id=ps.run_id,
-        latency_ms=best_latency if not best_error else ps.evolution.latency_ms if ps.evolution else 0,
+        latency_ms=best_latency if not best_error else (ps.evolution.latency_ms if ps.evolution else 0),
         error_rate=sum(1 for _, _, e, _ in results if e) / len(results),
         throughput_rps=1000 / max(best_latency, 1),
         fitness_score=best_fitness,
@@ -435,18 +415,21 @@ def node_evolve(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# NODE  6 — Finalize
+# NODE  6 — Finalize / Failed
 # ===========================================================================
+
 def _finalize(ps: PipelineState) -> Dict[str, Any]:
     ps.final_response = {
         "run_id": ps.run_id,
         "patient_id": ps.patient.patient_id,
-        "diagnosis": ps.localization.translated_diagnosis if ps.localization else (
-            ps.clinical.diagnosis_candidates if ps.clinical else []
+        "diagnosis": (
+            ps.localization.translated_diagnosis if ps.localization
+            else (ps.clinical.diagnosis_candidates if ps.clinical else [])
         ),
         "urgency": ps.clinical.urgency_level if ps.clinical else "unknown",
-        "actions": ps.localization.translated_actions if ps.localization else (
-            ps.clinical.recommended_actions if ps.clinical else []
+        "actions": (
+            ps.localization.translated_actions if ps.localization
+            else (ps.clinical.recommended_actions if ps.clinical else [])
         ),
         "confidence": ps.clinical.confidence_score if ps.clinical else 0.0,
         "validation_passed": ps.validation.passed if ps.validation else False,
@@ -459,8 +442,7 @@ def _finalize(ps: PipelineState) -> Dict[str, Any]:
 
 
 def node_finalize(state: Dict[str, Any]) -> Dict[str, Any]:
-    ps = PipelineState(**state)
-    return _finalize(ps)
+    return _finalize(PipelineState(**state))
 
 
 def node_failed(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -475,30 +457,25 @@ def node_failed(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# ROUTING  — Conditional edges
+# ROUTING — Conditional edges
 # ===========================================================================
 
 def route_after_validation(state: Dict[str, Any]) -> str:
-    ps = PipelineState(**state)
-    if ps.stage == "self_healing":
-        return "self_healing"
-    return "evolve"
+    return "self_healing" if PipelineState(**state).stage == "self_healing" else "evolve"
 
 
 def route_after_self_healing(state: Dict[str, Any]) -> str:
-    ps = PipelineState(**state)
     stage_map = {
         "clinical":     "clinical",
         "localization": "localization",
         "validation":   "validation",
         "failed":       "failed",
     }
-    return stage_map.get(ps.stage, "validation")
+    return stage_map.get(PipelineState(**state).stage, "validation")
 
 
 def route_after_evolve(state: Dict[str, Any]) -> str:
-    ps = PipelineState(**state)
-    return "finalized" if ps.stage == "finalized" else "failed"
+    return "finalized" if PipelineState(**state).stage == "finalized" else "failed"
 
 
 # ===========================================================================
@@ -506,29 +483,24 @@ def route_after_evolve(state: Dict[str, Any]) -> str:
 # ===========================================================================
 
 def build_graph() -> StateGraph:
-    graph = StateGraph(dict)  # state is a plain dict (PipelineState serialized)
+    graph = StateGraph(dict)
 
-    # Register nodes
-    graph.add_node("clinical",      node_clinical)
-    graph.add_node("localization",  node_localization)
-    graph.add_node("validation",    node_validation)
-    graph.add_node("self_healing",  node_self_healing)
-    graph.add_node("evolve",        node_evolve)
-    graph.add_node("finalized",     node_finalize)
-    graph.add_node("failed",        node_failed)
+    graph.add_node("clinical",     node_clinical)
+    graph.add_node("localization", node_localization)
+    graph.add_node("validation",   node_validation)
+    graph.add_node("self_healing", node_self_healing)
+    graph.add_node("evolve",       node_evolve)
+    graph.add_node("finalized",    node_finalize)
+    graph.add_node("failed",       node_failed)
 
-    # Linear happy path
     graph.add_edge("clinical",     "localization")
     graph.add_edge("localization", "validation")
 
-    # Conditional routing after validation
     graph.add_conditional_edges(
         "validation",
         route_after_validation,
         {"self_healing": "self_healing", "evolve": "evolve"},
     )
-
-    # Self-healing loop — routes back to any failed agent or re-validates
     graph.add_conditional_edges(
         "self_healing",
         route_after_self_healing,
@@ -539,25 +511,19 @@ def build_graph() -> StateGraph:
             "failed":       "failed",
         },
     )
-
-    # After evolution: finalize or fail
     graph.add_conditional_edges(
         "evolve",
         route_after_evolve,
         {"finalized": "finalized", "failed": "failed"},
     )
 
-    # Terminal nodes
     graph.add_edge("finalized", END)
     graph.add_edge("failed",    END)
-
-    # Entry point
     graph.set_entry_point("clinical")
 
     return graph
 
 
-# Compile once at import time — reuse across requests
 compiled_graph = build_graph().compile()
 
 
@@ -582,11 +548,9 @@ def run_pipeline(patient_data: dict, evolution_enabled: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Dev / smoke test
+# Smoke test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import json
-
     result = run_pipeline(
         patient_data={
             "patient_id": "TEST-001",
@@ -597,6 +561,6 @@ if __name__ == "__main__":
             "location": "NG-LA",
             "language": "en",
         },
-        evolution_enabled=False,   # set True for full self-evolving run
+        evolution_enabled=False,
     )
     print(json.dumps(result, indent=2, default=str))
