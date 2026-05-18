@@ -426,8 +426,8 @@ To view CI status: [Vision-Link AI Agent — Actions](https://github.com/BuhariS
 | **Buhari Salisu** | [@BuhariSalisuAI](https://github.com/BuhariSalisuAI) | Founder & CEO |
 | **Subhalaxmi**    | [@Subhalaxmi](https://github.com/Subhalaxmi)         | Data Engineer — CrewAI Agents & Tasks |
 | **Zentomo**       | [@Zentomo](https://github.com/Zentomo)               | Systems Engineer — LangGraph Orchestration & Infrastructure |
-| **Ramitha**       | [@Ramitha](https://github.com/Rami2212)              |Documentation   |
-| **Meghana**       | [@Meghana](https://github.com/Meghana)               | TBD |
+| **Ramitha**       | [@Ramitha](https://github.com/Rami2212)              | Documentation   |
+| **Meghana**       | [@Meghana](https://github.com/Meghana)               | Frontend Developer |
 
 ---
 
