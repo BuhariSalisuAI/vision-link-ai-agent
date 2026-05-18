@@ -277,7 +277,20 @@ _EVOLUTION_TIMEOUT  = 8.0
 
 
 def _compute_fitness(latency_ms: float, error: bool, throughput_rps: float) -> float:
-    """Lower is better. Penalise errors heavily."""
+    """
+    Fitness score — lower is better.
+
+    Formula:
+        fitness = latency_ms + error_penalty - (throughput_rps * 10)
+
+    Where:
+        latency_ms     : time to completion in milliseconds
+        error_penalty  : 1000.0 if the variant raised an exception, else 0.0
+        throughput_rps : requests per second (1000 / latency_ms)
+
+    The variant with the lowest fitness score that also produced valid output
+    is atomically promoted as the new live pipeline.
+    """
     error_penalty = 1_000.0 if error else 0.0
     return latency_ms + error_penalty - (throughput_rps * 10)
 
@@ -531,13 +544,18 @@ compiled_graph = build_graph().compile()
 # PUBLIC API
 # ===========================================================================
 
-def run_pipeline(patient_data: dict, evolution_enabled: bool = True) -> dict:
+def run_pipeline(patient_data: dict, evolution_enabled: bool | None = None) -> dict:
     """
     Main entry point.
     patient_data must match the PatientContext schema.
     Returns the final_response dict.
+
+    evolution_enabled: if None (default), reads EVOLUTION_ENABLED env var.
+                       Defaults to False if the env var is not set.
     """
     from state_schema import PatientContext
+    if evolution_enabled is None:
+        evolution_enabled = os.getenv("EVOLUTION_ENABLED", "false").lower() == "true"
     initial_state = PipelineState(
         patient=PatientContext(**patient_data),
         evolution_enabled=evolution_enabled,
