@@ -6,6 +6,14 @@ HuggingFace Model Loader  —  Zentomo's module
 Initializes Meta Llama-3-8B-Instruct (or MedLlama fallback) via
 HuggingFaceEndpoint for use across all LangGraph nodes and CrewAI agents.
 
+Inference mode: REMOTE — models run on HuggingFace Inference API servers.
+No local GPU is required. All inference is billed against the HF account
+associated with HF_TOKEN. The HuggingFaceEndpoint class makes authenticated
+HTTP requests to the HF Inference API; it does NOT load weights locally.
+
+No quantization is applied at this layer. Precision is managed server-side
+by HuggingFace based on the model configuration on the Hub.
+
 HF_TOKEN is read exclusively from the environment / GitHub Actions secret.
 It is NEVER hardcoded or logged.
 """
