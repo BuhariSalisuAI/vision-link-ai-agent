@@ -48,16 +48,18 @@ from state_schema import (
 def _llm_chat(system: str, user: str, node_name: str = "validation") -> str:
     """
     Calls the appropriate Llama-3-8B-Instruct endpoint for the given node.
-    Prompt is formatted as instruction-style for Llama-3 chat template.
+    Uses LangChain message objects — ChatHuggingFace handles chat templating.
     """
-    llm = get_llm_for_node(node_name)
-    prompt = (
-        f"<|begin_of_text|>"
-        f"<|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|>"
-        f"<|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|>"
-        f"<|start_header_id|>assistant<|end_header_id|>\n"
-    )
-    return llm.invoke(prompt).strip()
+    from langchain_core.messages import SystemMessage, HumanMessage
+
+    chat_model = get_llm_for_node(node_name)
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user),
+    ]
+    response = chat_model.invoke(messages)
+    # ChatHuggingFace returns an AIMessage; extract its text content
+    return response.content.strip()
 
 
 # ---------------------------------------------------------------------------
